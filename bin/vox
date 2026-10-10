@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""
+Vox Linux - Smart, Lightning-Fast Text-to-Speech & Podcast Generator for Linux
+Author: Adham (@domz-1)
+License: MIT
+"""
+
+import sys
+import os
+import re
+import time
+import argparse
+import subprocess
+import urllib.request
+import urllib.parse
+import tempfile
+import signal
+
+PID_FILE = "/tmp/vox_player.pid"
+
+os.environ["DISPLAY"] = os.environ.get("DISPLAY", ":0")
+
+def is_playing():
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return pid
+        except Exception:
+            try:
+                os.remove(PID_FILE)
+            except Exception:
+                pass
+    return None
+
+def stop_playback():
+    pid = is_playing()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            os.remove(PID_FILE)
+        except Exception:
+            pass
+        subprocess.run(["pkill", "-f", "mpv.*vox_temp"], stderr=subprocess.DEVNULL)
+        subprocess.run(["notify-send", "-u", "low", "-i", "audio-volume-muted", "Vox TTS", "⏹️ Stopped speech playback."])
+        return True
+    return False
+
+def detect_language(text):
+    if any('\u0600' <= c <= '\u06FF' for c in text):
+        return "ar"
+    if any(c in "éèêëàâîïôùûçÉÈÊËÀÂÎÏÔÙÛÇ" for c in text):
+        return "fr"
+    if any(c in "äöüßÄÖÜ" for c in text):
+        return "de"
+    if any(c in "ñáéíóú¿¡ÑÁÉÍÓÚ" for c in text):
+        return "es"
+    if any('\u3040' <= c <= '\u30FF' or '\u4E00' <= c <= '\u9FFF' for c in text):
+        return "ja"
+    return "en"
+
+def get_selected_text():
+    try:
+        res = subprocess.run(["xclip", "-o", "-selection", "primary"], capture_output=True, text=True, timeout=1)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["xclip", "-o", "-selection", "clipboard"], capture_output=True, text=True, timeout=1)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["copyq", "selection"], capture_output=True, text=True, timeout=1)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+
+    return ""
+
+def split_text(text, max_len=160):
+    text = re.sub(r'[\r\t]+', ' ', text)
+    text = re.sub(r' +', ' ', text).strip()
+    
+    sentences = re.split(r'([.!?,;\n\u060C\u061B\u061F]+)', text)
+    chunks = []
+    curr = ""
+    for piece in sentences:
+        if len(curr) + len(piece) <= max_len:
+            curr += piece
+        else:
+            if curr.strip():
+                chunks.append(curr.strip())
+            curr = piece
+    if curr.strip():
+        chunks.append(curr.strip())
+    
+    final_chunks = []
+    for c in chunks:
+        if len(c) > max_len:
+            words = c.split()
+            w_curr = ""
+            for w in words:
+                if len(w_curr) + len(w) + 1 <= max_len:
+                    w_curr += (" " + w if w_curr else w)
+                else:
+                    if w_curr: final_chunks.append(w_curr)
+                    w_curr = w
+            if w_curr: final_chunks.append(w_curr)
+        else:
+            final_chunks.append(c)
+            
+    return final_chunks
+
+def fetch_audio_chunk(text, lang="en"):
+    url = "https://translate.google.com/translate_tts?ie=UTF-8&q=" + urllib.parse.quote(text) + "&tl=" + lang + "&client=tw-ob"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+    with urllib.request.urlopen(req, timeout=8) as res:
+        return res.read()
+
+def generate_mp3(text, lang, output_file):
+    chunks = split_text(text)
+    if not chunks:
+        return False
+        
+    with open(output_file, "wb") as out:
+        for chunk in chunks:
+            try:
+                audio_bytes = fetch_audio_chunk(chunk, lang)
+                out.write(audio_bytes)
+            except Exception as e:
+                print(f"Error fetching audio chunk: {e}", file=sys.stderr)
+    return True
+
+def play_audio(mp3_path, speed=1.0):
+    cmd = [
+        "mpv",
+        "--no-video",
+        "--no-terminal",
+        f"--speed={speed}",
+        f"--title=vox_temp_player",
+        mp3_path
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    
+    proc.wait()
+    
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+    except Exception:
+        pass
+
+def main():
+    parser = argparse.ArgumentParser(description="Vox Linux - Smart Text-to-Speech & Podcast Generator")
+    parser.add_argument("text", nargs="*", help="Text to speak aloud")
+    parser.add_argument("-f", "--file", help="Read text from file")
+    parser.add_argument("-l", "--lang", help="Language code (e.g. ar, en, fr, de, es, ja). Auto-detected by default.")
+    parser.add_argument("-s", "--speed", type=float, default=1.0, help="Playback speed (e.g. 1.0, 1.25, 1.5)")
+    parser.add_argument("-o", "--save", help="Export to MP3 audio file instead of playing")
+    parser.add_argument("--stop", action="store_true", help="Stop any active speech playback")
+    parser.add_argument("--gui", action="store_true", help="Open GUI prompt for text input")
+    
+    args = parser.parse_args()
+
+    if args.stop:
+        if stop_playback():
+            print("Stopped playback.")
+        else:
+            print("No active playback found.")
+        return
+
+    # Check if triggered via shortcut while already playing -> Toggle Stop!
+    if not args.text and not args.file and sys.stdin.isatty():
+        if is_playing():
+            stop_playback()
+            return
+
+    text = ""
+    if args.file:
+        try:
+            with open(args.file, "r", encoding="utf-8") as f:
+                text = f.read()
+        except Exception as e:
+            print(f"Error reading file {args.file}: {e}", file=sys.stderr)
+            return
+    elif args.text:
+        text = " ".join(args.text)
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        text = get_selected_text()
+
+    if not text.strip() or args.gui:
+        try:
+            p = subprocess.run([
+                "zenity", "--entry",
+                "--title=Vox - Smart Text to Speech",
+                "--text=Enter or paste text to speak aloud:"
+            ], capture_output=True, text=True, timeout=60)
+            if p.returncode == 0:
+                text = p.stdout.strip()
+        except Exception:
+            pass
+
+    if not text.strip():
+        subprocess.run(["notify-send", "-u", "low", "-i", "audio-volume-muted", "Vox TTS", "⚠️ No text selected or provided to speak."])
+        return
+
+    lang = args.lang or detect_language(text)
+    snippet = (text[:90] + "...") if len(text) > 90 else text
+
+    if args.save:
+        out_path = os.path.abspath(args.save)
+        print(f"Generating MP3 audio to: {out_path} ({lang})...")
+        subprocess.run(["notify-send", "-u", "normal", "-i", "audio-x-generic", "Vox Podcast Maker", f"🎙️ Generating MP3...\n{snippet}"])
+        success = generate_mp3(text, lang, out_path)
+        if success and os.path.exists(out_path):
+            print(f"✓ Saved successfully: {out_path} ({os.path.getsize(out_path)} bytes)")
+            subprocess.run(["notify-send", "-u", "normal", "-i", "audio-x-generic", "Vox Podcast Maker", f"✅ MP3 saved successfully!\n{out_path}"])
+        else:
+            print("Failed to generate audio file.", file=sys.stderr)
+        return
+
+    with tempfile.NamedTemporaryFile(suffix="_vox_temp.mp3", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        flag_lang = "🇸🇦 العربية" if lang == "ar" else f"🌐 {lang.upper()}"
+        subprocess.run(["notify-send", "-u", "normal", "-i", "audio-volume-high", f"🔊 Vox Playing ({flag_lang})", snippet])
+        
+        generate_mp3(text, lang, tmp_path)
+        play_audio(tmp_path, speed=args.speed)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
